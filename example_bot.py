@@ -1,4 +1,4 @@
-"""Placement-oriented mechfight/1 bot with zone, cover, loot and combat policy."""
+"""Aggressive mechfight/1 bot with health-aware combat and zone policy."""
 import math
 import heapq
 import json
@@ -716,9 +716,9 @@ class Bot:
         now = obs["t"]
 
         hp_ratio = me["hp"] / max(1.0, me["max_hp"])
-        if hp_ratio < 0.55:
+        if hp_ratio < 0.42:
             self.recovering = True
-        elif hp_ratio >= 0.88:
+        elif hp_ratio >= 0.72:
             self.recovering = False
 
         if obs["offer"]:
@@ -734,11 +734,11 @@ class Bot:
         drop_decision = self.supply_drop_goal(obs, me)
 
         threats = []
-        many = len(enemies) >= 3 or (len(enemies) >= 2 and hp_ratio < 0.65)
+        many = len(enemies) >= 4 or (len(enemies) >= 2 and hp_ratio < 0.42)
         under_fire = now - self.last_damage < 3.0
-        if under_fire and hp_ratio < 0.72:
+        if under_fire and hp_ratio < 0.48:
             self.interrupt_until = max(self.interrupt_until, now + 1.5)
-        interrupting = now < self.interrupt_until and hp_ratio < 0.88
+        interrupting = now < self.interrupt_until and hp_ratio < 0.48
         for enemy in enemies:
             d = distance(enemy["pos"], me["pos"])
             if d < 105:
@@ -754,7 +754,7 @@ class Bot:
                     strength *= 1.6
                 threats.append((away, strength))
 
-        if self.recovering or many or interrupting or under_fire and hp_ratio < 0.72:
+        if self.recovering or many or interrupting:
             goal = safe_goal
             mode = "cover" if under_fire or many else "recover"
         else:
@@ -762,7 +762,7 @@ class Bot:
             mode = "zone"
         self.mode = mode
 
-        if drop_decision is not None and not many and not under_fire:
+        if drop_decision is not None and not many and not under_fire and not enemies:
             goal, drop = drop_decision
             ring = float(drop["radius"])
             if distance(goal, me["pos"]) <= ring:
@@ -775,27 +775,31 @@ class Bot:
             and target["kind"] != "crate"
             and not self.recovering
             and not many
-            and drop_decision is None
+            and me["in_zone"]
+            and (drop_decision is None or enemies)
         ):
-            enemy_hp_ratio = target.get("hp", 1400) / max(1.0, target.get("max_hp", 1400))
-            disadvantaged = hp_ratio + 0.12 < enemy_hp_ratio
-            if under_fire and target_distance < 70 and not disadvantaged:
-                mode = "fight"
-            elif enemy_hp_ratio < 0.30 and target_distance < 130:
-                mode = "finish"
-            elif target_distance < 55:
-                mode = "fight"
+            zone_center, zone_radius, _ = self.zone_state(obs, me)
+            zone_margin = max(12.0, min(40.0, zone_radius * 0.12))
+            target_in_zone = distance(target["pos"], zone_center) <= max(
+                0.0, zone_radius - zone_margin
+            )
+            if target_in_zone:
+                goal = target["pos"][:2]
+                enemy_hp_ratio = target.get("hp", 1400) / max(
+                    1.0, target.get("max_hp", 1400)
+                )
+                if enemy_hp_ratio < 0.30 and target_distance < 130:
+                    mode = "finish"
+                else:
+                    mode = "assault"
         endgame_hold = (
             obs["alive"] <= 6
             and obs["zone"]["radius"] <= 70
             and drop_decision is None
         )
-        if endgame_hold:
-            zone = obs["zone"]
-            if target and target["kind"] != "crate":
-                mode = "finish" if target_distance < 100 else "zone"
-            else:
-                mode = "zone"
+        if endgame_hold and mode not in ("assault", "finish", "cover", "recover"):
+            mode = "zone"
+            goal = safe_goal
 
         cube = None
         if mode in ("zone", "roam") and target is None and not endgame_hold:
@@ -809,7 +813,7 @@ class Bot:
                 goal = cube["pos"][:2]
                 mode = "cube"
 
-        if mode not in ("fight", "finish", "drop") and not many and not endgame_hold:
+        if mode not in ("assault", "fight", "finish", "drop") and not many and not endgame_hold:
             for pickup in obs["pickups"]:
                 kind = pickup["kind"]
                 d = distance(pickup["pos"], me["pos"])
@@ -828,16 +832,17 @@ class Bot:
             ]
             flee = unit(flee[0], flee[1])
             danger = max(weight for _, weight in threats)
-            if mode in ("cover", "recover") or hp_ratio < 0.72:
+            if mode in ("cover", "recover") or hp_ratio < 0.42:
                 move = unit(move[0] + flee[0] * (1.2 + danger),
                             move[1] + flee[1] * (1.2 + danger))
-            elif mode == "fight" and target_distance < 45:
+            elif mode in ("assault", "fight", "finish") and target_distance < 45:
                 tangent = [
                     -unit(target["pos"][0] - me["pos"][0], target["pos"][1] - me["pos"][1])[1] * self.strafe_sign,
                     unit(target["pos"][0] - me["pos"][0], target["pos"][1] - me["pos"][1])[0] * self.strafe_sign,
                 ]
-                move = unit(move[0] * 0.45 + tangent[0] * 0.55,
-                            move[1] * 0.45 + tangent[1] * 0.55)
+                forward_weight = 0.82 if mode == "assault" else 0.45
+                move = unit(move[0] * forward_weight + tangent[0] * (1.0 - forward_weight),
+                            move[1] * forward_weight + tangent[1] * (1.0 - forward_weight))
 
         dodge = self.incoming_dodge(obs, me)
         if dodge:
@@ -845,7 +850,7 @@ class Bot:
                         move[1] * 0.55 + dodge[1] * 0.45)
 
         goal_distance = distance(goal, me["pos"])
-        urgent = not me["in_zone"] or (mode in ("cover", "recover") and under_fire)
+        urgent = not me["in_zone"] or mode in ("cover", "recover")
 
         if not urgent and mode in ("zone", "cube", "loot", "drop") and not threats:
             walk = me["stats"].get("walk_speed", 11.7)
@@ -863,8 +868,10 @@ class Bot:
 
         boost = (
             math.hypot(move[0], move[1]) > 0.1
-            and me["energy"] > (30 if urgent else 45)
-            and (urgent or goal_distance > 50)
+            and me["energy"] > (
+                20 if mode in ("assault", "finish") else 30 if urgent else 45
+            )
+            and (mode in ("assault", "finish") or urgent or goal_distance > 50)
         )
         jump = bool(dodge and me["grounded"])
         action.update(move=move, boost=bool(boost), jump=jump)
@@ -882,14 +889,12 @@ class Bot:
         if target:
             target_distance = distance(target["pos"], me["pos"])
             estimated_target = bool(target.get("estimated", False))
-            if (
-                not estimated_target
-                and (
-                    mode in ("fight", "finish")
-                    or under_fire
-                    or target["kind"] == "crate"
-                )
-            ):
+            should_fire = (
+                target["kind"] != "crate"
+                or mode in ("assault", "fight", "finish")
+                or under_fire
+            )
+            if not estimated_target and should_fire:
                 gun_slot = next(
                     (i for i, weapon in enumerate(me["weapons"])
                      if weapon and weapon["kind"] == "gun"),

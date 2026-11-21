@@ -291,6 +291,10 @@ class Bot:
         self.target_lock_until = -100.0
         self.drop_id = None
         self.drop_blocked_until = {}
+        self.enemy_memory = {}
+        self.sound_tracks = []
+        self.mode_dwell_until = -100.0
+        self.dodge_side = 1.0 if self.slot % 2 else -1.0
         self.last_action = {"tick": 0, "move": [0.0, 0.0], "aim": [0.0, 0.0],
                             "boost": False, "jump": False, "fire": [False, False]}
         try:
@@ -300,12 +304,26 @@ class Bot:
 
     def remember(self, obs):
         now = obs["t"]
+        for enemy_id in list(self.enemy_memory):
+            if now - self.enemy_memory[enemy_id]["seen"] > self.memory_s:
+                del self.enemy_memory[enemy_id]
         for enemy_id in list(self.enemies):
             if now - self.enemies[enemy_id]["seen"] > self.memory_s:
                 del self.enemies[enemy_id]
 
         for actor in obs["mechs"]:
             if actor["kind"] == "mech":
+                predicted = actor["pos"][:]
+                velocity = actor.get("vel", [0.0, 0.0, 0.0])
+                self.enemy_memory[actor["id"]] = {
+                    "pos": predicted,
+                    "vel": velocity,
+                    "seen": now,
+                    "hp": actor.get("hp"),
+                    "max_hp": actor.get("max_hp"),
+                    "weapons": actor.get("weapons", []),
+                    "charging": actor.get("charging", False),
+                }
                 self.enemies[actor["id"]] = {
                     "pos": actor["pos"][:],
                     "vel": actor.get("vel", [0.0, 0.0, 0.0])[:],
@@ -319,6 +337,14 @@ class Bot:
                 }
             else:
                 pass
+
+        self.sound_tracks = [
+            sound for sound in obs["sounds"]
+            if sound["kind"] in (
+                "gun", "mortar", "explosion", "laser", "laser_charge",
+                "lightning", "npc_gun",
+            )
+        ]
 
         for event in obs["events"]:
             if event["type"] == "damaged":
@@ -372,6 +398,34 @@ class Bot:
             self.target_id = target["id"]
             self.target_lock_until = now + 0.8
             return target
+        if self.enemy_memory:
+            now = obs["t"]
+            stale = [
+                (enemy_id, track) for enemy_id, track in self.enemy_memory.items()
+                if now - track["seen"] <= self.memory_s
+            ]
+            if stale:
+                enemy_id, track = min(
+                    stale,
+                    key=lambda item: distance(item[1]["pos"], me["pos"]),
+                )
+                age = max(0.0, min(1.0, now - track["seen"]))
+                pos = [
+                    track["pos"][i] + track["vel"][i] * age
+                    for i in range(3)
+                ]
+                return {
+                    "id": enemy_id,
+                    "kind": "mech",
+                    "pos": pos,
+                    "vel": track["vel"],
+                    "aim": [0.0, 0.0],
+                    "hp": track["hp"],
+                    "max_hp": track["max_hp"],
+                    "weapons": track["weapons"],
+                    "charging": track["charging"],
+                    "estimated": True,
+                }
         return None
 
     def zone_state(self, obs, me):
@@ -628,6 +682,33 @@ class Bot:
         dx, dy, dz = point[0] - origin[0], point[1] - origin[1], point[2] - origin[2]
         return [math.atan2(dy, dx), math.atan2(dz, math.hypot(dx, dy))]
 
+    def mortar_aim(self, me, target):
+        weapon = next(
+            (item for item in me["weapons"] if isinstance(item, dict) and item["kind"] == "mortar"),
+            None,
+        )
+        if weapon is None:
+            return None
+        stats = weapon.get("stats", {})
+        speed = float(stats.get("speed", 72.0))
+        gravity = float(stats.get("gravity", self.config["weapons"]["mortar"].get("gravity", 22.0)))
+        muzzle_z = me["pos"][2] + me["stats"].get("muzzle_height", 7.0) + 2.5
+        horizontal = max(1.0, math.dist(me["pos"][:2], target["pos"][:2]))
+        vertical = target["pos"][2] + 4.5 - muzzle_z
+        discriminant = speed ** 4 - gravity * (
+            gravity * horizontal ** 2 + 2.0 * vertical * speed ** 2
+        )
+        if discriminant < 0:
+            return None
+        low = (speed ** 2 - math.sqrt(discriminant)) / (gravity * horizontal)
+        high = (speed ** 2 + math.sqrt(discriminant)) / (gravity * horizontal)
+        pitch = min((math.atan(low), math.atan(high)), key=lambda value: abs(value - 0.55))
+        yaw = math.atan2(target["pos"][1] - me["pos"][1],
+                         target["pos"][0] - me["pos"][0])
+        if not (me["stats"].get("min_pitch", -0.7) <= pitch <= me["stats"].get("max_pitch", 1.3)):
+            return None
+        return [yaw, pitch]
+
     def act(self, obs):
         me = obs["self"]
         self.remember(obs)
@@ -800,7 +881,15 @@ class Bot:
         fire = [False, False]
         if target:
             target_distance = distance(target["pos"], me["pos"])
-            if mode in ("fight", "finish") or under_fire or target["kind"] == "crate":
+            estimated_target = bool(target.get("estimated", False))
+            if (
+                not estimated_target
+                and (
+                    mode in ("fight", "finish")
+                    or under_fire
+                    or target["kind"] == "crate"
+                )
+            ):
                 gun_slot = next(
                     (i for i, weapon in enumerate(me["weapons"])
                      if weapon and weapon["kind"] == "gun"),
@@ -814,6 +903,11 @@ class Bot:
                 laser_slot = next(
                     (i for i, weapon in enumerate(me["weapons"])
                      if weapon and weapon["kind"] == "laser"),
+                    None,
+                )
+                mortar_slot = next(
+                    (i for i, weapon in enumerate(me["weapons"])
+                     if weapon and weapon["kind"] == "mortar"),
                     None,
                 )
 
@@ -843,6 +937,23 @@ class Bot:
                     full_charge = weapon["stats"].get("charge", 0.75)
                     if weapon["cooldown"] <= 0.02:
                         fire[laser_slot] = charge < full_charge * 0.88 or not aligned
+                elif (
+                    mortar_slot is not None
+                    and not target.get("estimated", False)
+                    and 24 < target_distance < 220
+                ):
+                    weapon = me["weapons"][mortar_slot]
+                    solution = self.mortar_aim(me, target)
+                    if solution is not None:
+                        aim = solution
+                        yaw_error = abs(wrap_angle(aim[0] - me["aim"][0]))
+                        pitch_error = abs(aim[1] - me["aim"][1])
+                        if (
+                            weapon["cooldown"] <= 0.02
+                            and yaw_error < 0.10
+                            and pitch_error < 0.12
+                        ):
+                            fire[mortar_slot] = True
                 elif gun_slot is not None and target_distance < 230:
                     gun = me["weapons"][gun_slot]
                     gun_speed = gun["stats"].get("speed", 252)

@@ -1,6 +1,8 @@
 """Placement-focused mechfight/1 bot."""
 import math
+import sys
 import mechfight as mf
+from navigation import ArenaNavigator
 
 
 def distance(a, b):
@@ -47,6 +49,12 @@ class Bot:
         self.last_damaged_at = -100.0
         self.weapon_value = {"gun": 1.0, "mortar": 2.0, "laser": 2.7, "lightning": 3.0}
         self.patrol_angle = (hello["slot"] * 2.399963229728653) % (2 * math.pi)
+        self.strafe_sign = 1.0 if hello["slot"] % 2 else -1.0
+        self.navigator = None
+        try:
+            self.navigator = ArenaNavigator(hello["map"]["dir"], self.config["mech"])
+        except (OSError, ValueError, KeyError) as error:
+            print(f"arena navigation unavailable: {error}", file=sys.stderr)
 
     def remember(self, obs):
         now = obs["t"]
@@ -297,23 +305,38 @@ class Bot:
         if not offer:
             return None
         held = {weapon["kind"] for weapon in me["weapons"] if weapon}
+        scores = {
+            "plating": 10.0,
+            "armor": 9.5,
+            "nanites": 9.0,
+            "servos": 8.5,
+            "jets": 7.5,
+            "reactor": 7.0,
+            "lightning_efficiency": 7.0,
+            "capacitor": 6.5,
+            "lightning_range": 6.5,
+            "laser_charge": 6.5,
+            "sensors": 6.0,
+            "laser_damage": 6.0,
+            "gyros": 5.5,
+            "gun_damage": 5.5,
+            "gun_rate": 5.0,
+            "lightning_chain": 5.5,
+            "laser_pierce": 4.5,
+            "mortar_reload": 4.5,
+            "gun_velocity": 4.0,
+            "gun_mag": 4.0,
+            "mortar_splash": 4.0,
+            "mortar_velocity": 3.5,
+        }
         definitions = {upgrade["id"]: upgrade for upgrade in self.config["upgrades"]}
 
         def score(choice):
             upgrade = definitions.get(choice["id"], {})
-            text = (choice["id"] + " " + choice["name"] + " " + choice["desc"]).lower()
             requirement = upgrade.get("requires")
             if requirement and requirement not in held:
-                return -100
-            if any(word in text for word in ("armor", "damage taken", "health", "regen", "repair")):
-                return 10
-            if any(word in text for word in ("energy", "boost", "walk speed", "movement", "jet")):
-                return 8
-            if any(word in text for word in ("sensor", "vision", "sight")):
-                return 6
-            if any(word in text for word in ("damage", "fire rate", "cooldown", "reload")):
-                return 5
-            return 1
+                return -100.0
+            return scores.get(choice["id"], 0.0)
 
         return max(range(len(offer["choices"])), key=lambda i: score(offer["choices"][i]))
 
@@ -375,9 +398,21 @@ class Bot:
         ):
             safe_goal = self.patrol_destination(obs, me)
         goal, objective_kind = self.objective(obs, me, safe_goal, enemy)
-        dx, dy = goal[0] - me["pos"][0], goal[1] - me["pos"][1]
-        goal_distance = math.hypot(dx, dy)
-        move = unit(dx, dy) if goal_distance > 2.5 else [0.0, 0.0]
+        routed = (
+            self.navigator.direction(me["pos"][:2], goal)
+            if self.navigator is not None else None
+        )
+        goal_distance = distance(me["pos"], goal)
+        dx, dy = routed if routed is not None else (
+            goal[0] - me["pos"][0], goal[1] - me["pos"][1]
+        )
+        path_distance = math.hypot(dx, dy)
+        if goal_distance <= 2.5:
+            move = [0.0, 0.0]
+        elif routed is not None and path_distance > 0.5:
+            move = unit(dx, dy)
+        else:
+            move = unit(goal[0] - me["pos"][0], goal[1] - me["pos"][1])
 
         threats = []
         for actor in obs["mechs"]:
@@ -409,15 +444,25 @@ class Bot:
             if me["hp"] < me["max_hp"] * 0.55:
                 strength *= 1.4
             away = unit(-ex, -ey)
-            threats.append((away, strength))
+            threats.append((away, strength, actor))
 
         if threats:
             flee = [
-                sum(direction[axis] * weight for direction, weight in threats)
+                sum(direction[axis] * weight for direction, weight, _ in threats)
                 for axis in (0, 1)
             ]
             flee = unit(flee[0], flee[1])
-            danger = max(weight for _, weight in threats)
+            danger = max(weight for _, weight, _ in threats)
+            closest_threat = min(
+                (actor for _, _, actor in threats),
+                key=lambda actor: distance(actor["pos"], me["pos"]),
+            )
+            ex = closest_threat["pos"][0] - me["pos"][0]
+            ey = closest_threat["pos"][1] - me["pos"][1]
+            toward_enemy = unit(ex, ey)
+            tangent = [-toward_enemy[1] * self.strafe_sign, toward_enemy[0] * self.strafe_sign]
+            flee = unit(flee[0] * 0.8 + tangent[0] * 0.6,
+                        flee[1] * 0.8 + tangent[1] * 0.6)
             zone_weight = 3.0 if goal_distance > 8 else 0.0
             flee_weight = 1.1 + danger * (1.4 if me["hp"] < me["max_hp"] * 0.6 else 1.0)
             move = unit(move[0] * zone_weight + flee[0] * flee_weight,
@@ -446,6 +491,8 @@ class Bot:
             else:
                 move = unit(move[0] * 0.75 + dodge[0] * 0.25,
                             move[1] * 0.75 + dodge[1] * 0.25)
+        if self.navigator is not None:
+            move = self.navigator.constrain(me["pos"][:2], move)
 
         zone = obs["zone"]
         phase_active = obs["t"] >= zone["shrink_start"]
@@ -457,7 +504,7 @@ class Bot:
         urgency = zone_urgent or (enemy is not None and distance(enemy["pos"], me["pos"]) < 30)
         boost = bool(
             math.hypot(*move) > 0.1
-            and me["energy"] > (8 if urgency else 45)
+            and me["energy"] > (30 if urgency else 45)
             and (urgency or goal_distance > 50)
         )
         action.update(move=move, boost=boost, jump=bool(dodge and me["grounded"]))

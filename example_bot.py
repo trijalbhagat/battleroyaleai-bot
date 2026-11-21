@@ -46,6 +46,7 @@ class Bot:
         self.last_damaged_bearing = None
         self.last_damaged_at = -100.0
         self.weapon_value = {"gun": 1.0, "mortar": 2.0, "laser": 2.7, "lightning": 3.0}
+        self.patrol_angle = (hello["slot"] * 2.399963229728653) % (2 * math.pi)
 
     def remember(self, obs):
         now = obs["t"]
@@ -67,10 +68,22 @@ class Bot:
     def closest_enemy(self, obs, me):
         visible_mechs = [a for a in obs["mechs"] if a["kind"] == "mech"]
         if visible_mechs:
-            return min(
-                visible_mechs,
-                key=lambda a: distance(a["pos"], me["pos"]) - 0.01 * a.get("hp", 1000),
-            )
+            def threat_score(actor):
+                d = distance(actor["pos"], me["pos"])
+                score = d - 0.01 * actor.get("hp", 1000)
+                if actor.get("charging"):
+                    score -= 35
+                if actor["id"] == self.last_attacker and obs["t"] - self.last_attacked_at < 10:
+                    score -= 65
+                bearing_to_me = math.atan2(
+                    me["pos"][1] - actor["pos"][1],
+                    me["pos"][0] - actor["pos"][0],
+                )
+                if d < 220 and abs(angle_delta(bearing_to_me, actor["aim"][0])) < 0.35:
+                    score -= 25
+                return score
+
+            return min(visible_mechs, key=threat_score)
         drones = [a for a in obs["mechs"] if a["kind"] == "npc"]
         if drones:
             return min(drones, key=lambda a: distance(a["pos"], me["pos"]))
@@ -124,52 +137,84 @@ class Bot:
         zone = obs["zone"]
         pos = me["pos"]
         if not me["in_zone"]:
-            return zone["center"][:]
-
-        phase_has_started = obs["t"] >= zone["shrink_start"]
-        if not phase_has_started:
-            next_distance = distance(pos, zone["next_center"])
-            next_staging_radius = zone["next_radius"] * 0.50
-            distance_to_staging = max(0.0, next_distance - next_staging_radius)
-            speed = me["stats"].get("walk_speed", 11.7)
-            if me["energy"] > 25:
-                speed = max(speed, me["stats"].get("boost_speed", speed) * 0.7)
-            time_to_staging = distance_to_staging / max(1.0, speed)
-            time_until_shrink = zone["shrink_start"] - obs["t"]
-            phase_has_started = time_until_shrink <= time_to_staging + 10.0
-
-        if not phase_has_started:
             center, radius = zone["center"], zone["radius"]
+            return self.inside_circle(pos, center, radius, 18.0)
+
+        current_center, current_radius = zone["center"], zone["radius"]
+        next_center, next_radius = zone["next_center"], zone["next_radius"]
+        next_buffer = max(18.0, min(45.0, next_radius * 0.12))
+        next_safe_radius = max(0.0, next_radius - next_buffer)
+        next_distance = distance(pos, next_center)
+        distance_to_next_safe = max(0.0, next_distance - next_safe_radius)
+
+        walk_speed = max(1.0, me["stats"].get("walk_speed", 11.7))
+        boost_speed = max(walk_speed, me["stats"].get("boost_speed", walk_speed))
+        travel_speed = boost_speed if me["energy"] > 30 else walk_speed
+        travel_time = distance_to_next_safe / travel_speed
+        until_start = max(0.0, zone["shrink_start"] - obs["t"])
+        until_end = max(0.0, zone["shrink_end"] - obs["t"])
+
+        if obs["t"] >= zone["shrink_start"]:
+            phase_active = True
         else:
-            center, radius = zone["next_center"], zone["next_radius"]
+            # Keep a safe position instead of crossing the map early. Start only
+            # when the remaining hold is close to the estimated travel time.
+            phase_active = until_start <= travel_time + 8.0
 
-        if radius <= 1:
-            return center[:]
+        if phase_active:
+            return self.inside_circle(pos, next_center, next_safe_radius, 0.0)
 
-        # Use the inner half of the active circle as a low-risk staging area.
-        desired_radius = radius * (0.50 if radius < 80 else 0.58)
+        current_buffer = max(18.0, min(45.0, current_radius * 0.10))
+        current_safe_radius = max(0.0, current_radius - current_buffer)
+        if distance(pos, current_center) > current_safe_radius:
+            return self.inside_circle(pos, current_center, current_safe_radius, 0.0)
+        return pos[:2]
+
+    @staticmethod
+    def inside_circle(pos, center, radius, margin):
+        radius = max(0.0, radius - margin)
         dx, dy = pos[0] - center[0], pos[1] - center[1]
-        current_radius = math.hypot(dx, dy)
-        if current_radius <= desired_radius:
+        d = math.hypot(dx, dy)
+        if d <= radius or d < 1e-8:
             return pos[:2]
-        destination_radius = max(0.0, desired_radius - min(8.0, radius * 0.04))
-        direction = unit(dx, dy)
-        return [
-            center[0] + direction[0] * destination_radius,
-            center[1] + direction[1] * destination_radius,
-        ]
+        scale = radius / d
+        return [center[0] + dx * scale, center[1] + dy * scale]
+
+    def patrol_destination(self, obs, me):
+        zone = obs["zone"]
+        center, radius = zone["center"], zone["radius"]
+        dx, dy = me["pos"][0] - center[0], me["pos"][1] - center[1]
+        radial_distance = math.hypot(dx, dy)
+        if radial_distance > 1e-6:
+            self.patrol_angle = math.atan2(dy, dx)
+
+        # A gentle outward relocation disperses bots from the shared drop area,
+        # then leaves them at a safe mid-radius rather than circling needlessly.
+        if radial_distance < radius * 0.52 or radial_distance > radius * 0.78:
+            target_radius = radius * 0.66
+            return [
+                center[0] + math.cos(self.patrol_angle) * target_radius,
+                center[1] + math.sin(self.patrol_angle) * target_radius,
+            ]
+        return me["pos"][:2]
 
     def safe_objective(self, point, obs, margin=0.72):
         zone = obs["zone"]
-        if obs["t"] < zone["shrink_start"]:
-            center, radius = zone["center"], zone["radius"]
-        else:
-            center, radius = zone["next_center"], zone["next_radius"]
+        phase = obs["t"] >= zone["shrink_start"]
+        if not phase:
+            current_distance = distance(point, zone["center"])
+            current_safe = zone["radius"] * margin
+            next_distance = distance(point, zone["next_center"])
+            next_safe = zone["next_radius"] * margin
+            return current_distance <= current_safe and next_distance <= next_safe
+        center, radius = zone["next_center"], zone["next_radius"]
         return distance(point, center) <= radius * margin
 
     def objective(self, obs, me, safe_goal, nearest_enemy):
         pos = me["pos"]
         if not me["in_zone"]:
+            return safe_goal, "zone"
+        if distance(safe_goal, pos) > 2.5:
             return safe_goal, "zone"
         danger_distance = distance(nearest_enemy["pos"], pos) if nearest_enemy else float("inf")
         if danger_distance > 55:
@@ -319,6 +364,16 @@ class Bot:
 
         enemy = self.closest_enemy(obs, me)
         safe_goal = self.safe_destination(obs, me)
+        zone = obs["zone"]
+        next_safe_radius = max(0.0, zone["next_radius"] - max(18.0, min(45.0, zone["next_radius"] * 0.12)))
+        outside_next = distance(me["pos"], zone["next_center"]) > next_safe_radius
+        if (
+            me["in_zone"]
+            and obs["t"] < zone["shrink_start"]
+            and outside_next
+            and distance(safe_goal, me["pos"]) < 1e-6
+        ):
+            safe_goal = self.patrol_destination(obs, me)
         goal, objective_kind = self.objective(obs, me, safe_goal, enemy)
         dx, dy = goal[0] - me["pos"][0], goal[1] - me["pos"][1]
         goal_distance = math.hypot(dx, dy)
@@ -332,13 +387,27 @@ class Bot:
             d = math.hypot(ex, ey)
             if d >= 105:
                 continue
+            bearing_to_me = math.atan2(
+                me["pos"][1] - actor["pos"][1],
+                me["pos"][0] - actor["pos"][0],
+            )
+            aiming_at_me = abs(angle_delta(bearing_to_me, actor["aim"][0])) < 0.35
+            attacking_me = (
+                actor.get("charging")
+                or actor["id"] == self.last_attacker and obs["t"] - self.last_attacked_at < 10
+                or aiming_at_me and d < 220
+            )
+            if d > 65 and not attacking_me:
+                continue
             strength = (105.0 - d) / 105.0
             if actor.get("charging"):
-                strength *= 1.6
-            if actor["id"] == self.last_attacker and obs["t"] - self.last_attacked_at < 8:
                 strength *= 1.8
+            if actor["id"] == self.last_attacker and obs["t"] - self.last_attacked_at < 10:
+                strength *= 2.0
+            if aiming_at_me:
+                strength *= 1.4
             if me["hp"] < me["max_hp"] * 0.55:
-                strength *= 1.5
+                strength *= 1.4
             away = unit(-ex, -ey)
             threats.append((away, strength))
 
@@ -349,21 +418,24 @@ class Bot:
             ]
             flee = unit(flee[0], flee[1])
             danger = max(weight for _, weight in threats)
-            zone_weight = 3.0 if not me["in_zone"] else (1.0 if goal_distance > 8 else 0.0)
-            active_center = obs["zone"]["center"]
-            active_radius = obs["zone"]["radius"]
-            if obs["t"] >= obs["zone"]["shrink_start"]:
-                active_center = obs["zone"]["next_center"]
-                active_radius = obs["zone"]["next_radius"]
-            edge_margin = active_radius - distance(me["pos"], active_center)
-            if edge_margin < 35:
-                zone_weight = max(zone_weight, 3.0)
+            zone_weight = 3.0 if goal_distance > 8 else 0.0
             flee_weight = 1.1 + danger * (1.4 if me["hp"] < me["max_hp"] * 0.6 else 1.0)
             move = unit(move[0] * zone_weight + flee[0] * flee_weight,
                         move[1] * zone_weight + flee[1] * flee_weight)
+            active_center = (
+                obs["zone"]["next_center"]
+                if obs["t"] >= obs["zone"]["shrink_start"]
+                else obs["zone"]["center"]
+            )
+            active_radius = (
+                obs["zone"]["next_radius"]
+                if obs["t"] >= obs["zone"]["shrink_start"]
+                else obs["zone"]["radius"]
+            )
             radial = unit(me["pos"][0] - active_center[0], me["pos"][1] - active_center[1])
             outward = move[0] * radial[0] + move[1] * radial[1]
-            if edge_margin < 25 and outward > 0:
+            edge_margin = active_radius - distance(me["pos"], active_center)
+            if edge_margin < 35 and outward > 0:
                 move = unit(move[0] - radial[0] * outward, move[1] - radial[1] * outward)
 
         dodge = self.evasion(obs, me)
@@ -375,11 +447,18 @@ class Bot:
                 move = unit(move[0] * 0.75 + dodge[0] * 0.25,
                             move[1] * 0.75 + dodge[1] * 0.25)
 
-        urgency = not me["in_zone"] or (enemy is not None and distance(enemy["pos"], me["pos"]) < 30)
+        zone = obs["zone"]
+        phase_active = obs["t"] >= zone["shrink_start"]
+        zone_deadline = zone["shrink_end"] if phase_active else zone["shrink_start"]
+        zone_eta = goal_distance / max(1.0, me["stats"].get("walk_speed", 11.7))
+        zone_urgent = not me["in_zone"] or (
+            goal_distance > 8 and zone_deadline - obs["t"] < zone_eta + 6
+        )
+        urgency = zone_urgent or (enemy is not None and distance(enemy["pos"], me["pos"]) < 30)
         boost = bool(
             math.hypot(*move) > 0.1
-            and me["energy"] > (12 if urgency else 35)
-            and (urgency or goal_distance > 28)
+            and me["energy"] > (8 if urgency else 45)
+            and (urgency or goal_distance > 50)
         )
         action.update(move=move, boost=boost, jump=bool(dodge and me["grounded"]))
 
@@ -407,10 +486,23 @@ class Bot:
             recently_attacked = (
                 target_id == self.last_attacker and obs["t"] - self.last_attacked_at < 8
             )
-            danger_close = target_distance < (42 if target["kind"] == "mech" else 32)
-            engage = danger_close or (recently_attacked and target_distance < 100)
-            if target.get("charging") and target_distance < 150 and me["hp"] > me["max_hp"] * 0.35:
-                engage = True
+            bearing_to_me = math.atan2(
+                me["pos"][1] - target["pos"][1],
+                me["pos"][0] - target["pos"][0],
+            )
+            aiming_at_me = abs(angle_delta(bearing_to_me, target["aim"][0])) < 0.35
+            under_pressure = (
+                recently_attacked
+                or aiming_at_me
+                or target.get("charging")
+            )
+            low_hp_opportunity = (
+                target.get("hp") is not None
+                and target.get("max_hp", 1400) > 0
+                and target["hp"] / target.get("max_hp", 1400) < 0.45
+            )
+            engagement_range = 210 if under_pressure else (150 if low_hp_opportunity else 80)
+            engage = target_distance <= engagement_range
             if engage:
                 weapons = me["weapons"]
                 direct_weapon = next(
@@ -458,7 +550,11 @@ class Bot:
                     aligned = yaw_error < 0.12 and pitch_error < 0.12
 
                     if kind == "gun":
-                        if weapon.get("ammo", 0) > 0 and weapon.get("reload", 0) <= 0 and aligned:
+                        if (
+                            weapon.get("ammo", 0) > 0
+                            and weapon.get("reload", 0) <= 0
+                            and (aligned or target_distance < 45)
+                        ):
                             fire[direct_weapon] = True
                         if not fire[direct_weapon] and weapon.get("reload", 0) <= 0 and (
                             weapon.get("ammo", 0) <= 0

@@ -20,6 +20,13 @@ def wrap_angle(angle):
     return (angle + math.pi) % TAU - math.pi
 
 
+def zone_eta_if_known(obs, now):
+    zone = obs["zone"]
+    if now >= zone["shrink_end"]:
+        return 25.0
+    return max(1.0, zone["shrink_end"] - now)
+
+
 def lead_position(origin, target, projectile_speed):
     if projectile_speed is None or projectile_speed <= 0:
         return target["pos"][:]
@@ -58,6 +65,11 @@ class Bot:
         self.last_damage_bearing = None
         self.last_attacker = None
         self.last_attacker_time = -100.0
+        self.last_damage_weapon = None
+        self.last_damage_amount = 0.0
+        self.last_damage_rear = False
+        self.interrupt_until = -100.0
+        self.last_obs_time = -100.0
         self.recovering = False
         self.mode = "roam"
         self.stuck = 0.0
@@ -65,6 +77,12 @@ class Bot:
         self.previous_move = [0.0, 0.0]
         self.strafe_sign = 1.0 if self.slot % 2 else -1.0
         self.navigator = None
+        self.target_id = None
+        self.target_lock_until = -100.0
+        self.drop_id = None
+        self.drop_blocked_until = {}
+        self.last_action = {"tick": 0, "move": [0.0, 0.0], "aim": [0.0, 0.0],
+                            "boost": False, "jump": False, "fire": [False, False]}
         try:
             self.navigator = ArenaNavigator(hello["map"]["dir"], self.config["mech"])
         except (OSError, KeyError, ValueError):
@@ -96,9 +114,14 @@ class Bot:
             if event["type"] == "damaged":
                 self.last_damage = now
                 self.last_damage_bearing = event.get("bearing")
+                self.last_damage_weapon = event.get("weapon")
+                self.last_damage_amount = event.get("amount", 0)
+                self.last_damage_rear = bool(event.get("rear", False))
                 if event.get("by") is not None:
                     self.last_attacker = event["by"]
                     self.last_attacker_time = now
+            elif event["type"] == "drop":
+                self.drop_blocked_until[event["id"]] = now + 30.0
 
         for item in obs["pickups"] + obs["cubes"]:
             key = ("pickup" if "kind" in item else "cube", item["id"])
@@ -128,10 +151,17 @@ class Bot:
     def choose_target(self, obs, me):
         visible = self.visible_mechs(obs)
         if visible:
-            return min(
-                visible,
-                key=lambda enemy: self.target_score(enemy, me, obs["t"]),
-            )
+            now = obs["t"]
+            if self.target_id is not None and now < self.target_lock_until:
+                locked = next((enemy for enemy in visible if enemy["id"] == self.target_id), None)
+                if locked is not None:
+                    distance_m = distance(locked["pos"], me["pos"])
+                    if distance_m < 230:
+                        return locked
+            target = min(visible, key=lambda enemy: self.target_score(enemy, me, now))
+            self.target_id = target["id"]
+            self.target_lock_until = now + 0.8
+            return target
         return None
 
     def zone_state(self, obs, me):
@@ -201,6 +231,9 @@ class Bot:
         offer = obs["offer"]
         held = {weapon["kind"] for weapon in me["weapons"] if weapon}
         hp_ratio = me["hp"] / max(1.0, me["max_hp"])
+        existing = {}
+        for upgrade_id in me.get("upgrades", []):
+            existing[upgrade_id] = existing.get(upgrade_id, 0) + 1
         priorities = {
             "armor": 100,
             "plating": 96 if hp_ratio < 0.75 else 88,
@@ -232,6 +265,8 @@ class Bot:
             definition = definitions.get(choice["id"], {})
             required = definition.get("requires")
             if required and required not in held:
+                continue
+            if existing.get(choice["id"], 0) >= definition.get("max", 999):
                 continue
             score = priorities.get(choice["id"], 1)
             if score > best_score:
@@ -281,11 +316,15 @@ class Bot:
                 continue
             flight = max(0.0, min(1.4, -(rx * vx + ry * vy) / speed_sq))
             miss = math.hypot(rx + vx * flight, ry + vy * flight)
-            if flight < 1.4 and miss < 8:
-                threats.append((vx, vy))
+            rz = projectile["pos"][2] - me["pos"][2]
+            vz = projectile["vel"][2] - me["vel"][2]
+            vertical_miss = abs(rz + vz * flight)
+            miss_3d = math.sqrt(miss * miss + vertical_miss * vertical_miss)
+            if flight < 1.4 and miss_3d < 9:
+                threats.append((vx, vy, flight, miss_3d))
         if not threats:
             return None
-        vx, vy = threats[0]
+        vx, vy, _, _ = min(threats, key=lambda threat: (threat[2], threat[3]))
         direction = unit(-vy, vx)
         return direction
 
@@ -314,6 +353,62 @@ class Bot:
             "max_hp": 300,
             "weapons": [],
         }
+
+    def supply_drop_goal(self, obs, me):
+        now = obs["t"]
+        enemies = self.visible_mechs(obs)
+        hp_ratio = me["hp"] / max(1.0, me["max_hp"])
+        cube_threshold = next(
+            (threshold for threshold in self.config["cubes"]["upgrade_thresholds"]
+             if threshold > me["cubes"]),
+            999,
+        )
+        cube_near_offer = cube_threshold - me["cubes"] <= 3
+        for drop in obs["drops"]:
+            drop_id = drop["id"]
+            if now < self.drop_blocked_until.get(drop_id, -1):
+                continue
+            if drop.get("holder") not in (None, me["id"]):
+                continue
+            landing_eta = max(0.0, float(drop["lands_in"]))
+            travel_eta = distance(drop["pos"], me["pos"]) / max(
+                1.0,
+                me["stats"].get("boost_speed", me["stats"].get("walk_speed", 11.7)),
+            )
+            eta = max(landing_eta, travel_eta)
+            if drop.get("holder") == me["id"]:
+                capture_remaining = max(0.0, float(drop["capture_s"]) - float(drop["progress"]))
+            else:
+                capture_remaining = float(drop["capture_s"])
+            if eta + capture_remaining + 3.0 > max(25.0, zone_eta_if_known(obs, now)):
+                continue
+            if drop["lands_in"] > 18:
+                continue
+            point = drop["pos"][:2]
+            d = distance(point, me["pos"])
+            if d > 95:
+                continue
+            if hp_ratio < 0.45 or cube_near_offer or me["cubes"] < 5:
+                pass
+            else:
+                continue
+            if any(distance(point, enemy["pos"]) < 80 for enemy in enemies):
+                continue
+            zone = obs["zone"]
+            if obs["t"] >= zone["shrink_start"]:
+                center = zone["next_center"]
+                radius = zone["next_radius"]
+            else:
+                center = zone["center"]
+                radius = zone["radius"]
+            if distance(point, center) > radius * 0.82:
+                continue
+            if me["pos"][2] - drop["pos"][2] > 12:
+                continue
+            self.drop_id = drop_id
+            return drop["pos"][:2], drop
+        self.drop_id = None
+        return None
 
     def direct_aim(self, me, target, gun_speed=None):
         target_pos = target["pos"][:]
@@ -346,10 +441,14 @@ class Bot:
         target = self.choose_target(obs, me) if enemies else self.crate_target(obs, me)
         safe_goal = self.safe_goal(obs, me)
         target_distance = distance(target["pos"], me["pos"]) if target else 10000
+        drop_decision = self.supply_drop_goal(obs, me)
 
         threats = []
         many = len(enemies) >= 3 or (len(enemies) >= 2 and hp_ratio < 0.65)
         under_fire = now - self.last_damage < 3.0
+        if under_fire and hp_ratio < 0.72:
+            self.interrupt_until = max(self.interrupt_until, now + 1.5)
+        interrupting = now < self.interrupt_until and hp_ratio < 0.88
         for enemy in enemies:
             d = distance(enemy["pos"], me["pos"])
             if d < 105:
@@ -359,11 +458,13 @@ class Bot:
                 strength = (105 - d) / 105
                 if enemy["id"] == self.last_attacker:
                     strength *= 1.8
+                    if self.last_damage_rear:
+                        strength *= 1.25
                 if enemy.get("charging"):
                     strength *= 1.6
                 threats.append((away, strength))
 
-        if self.recovering or many or under_fire and hp_ratio < 0.72:
+        if self.recovering or many or interrupting or under_fire and hp_ratio < 0.72:
             goal = safe_goal
             mode = "cover" if under_fire or many else "recover"
         else:
@@ -371,7 +472,21 @@ class Bot:
             mode = "zone"
         self.mode = mode
 
-        if target and target["kind"] != "crate" and not self.recovering and not many:
+        if drop_decision is not None and not many and not under_fire:
+            goal, drop = drop_decision
+            ring = float(drop["radius"])
+            if distance(goal, me["pos"]) <= ring:
+                goal = me["pos"][:2]
+            mode = "drop"
+            self.mode = mode
+
+        if (
+            target
+            and target["kind"] != "crate"
+            and not self.recovering
+            and not many
+            and drop_decision is None
+        ):
             enemy_hp_ratio = target.get("hp", 1400) / max(1.0, target.get("max_hp", 1400))
             disadvantaged = hp_ratio + 0.12 < enemy_hp_ratio
             if under_fire and target_distance < 70 and not disadvantaged:
@@ -380,9 +495,20 @@ class Bot:
                 mode = "finish"
             elif target_distance < 55:
                 mode = "fight"
+        endgame_hold = (
+            obs["alive"] <= 6
+            and obs["zone"]["radius"] <= 70
+            and drop_decision is None
+        )
+        if endgame_hold:
+            zone = obs["zone"]
+            if target and target["kind"] != "crate":
+                mode = "finish" if target_distance < 100 else "zone"
+            else:
+                mode = "zone"
 
         cube = None
-        if mode in ("zone", "roam") and target is None:
+        if mode in ("zone", "roam") and target is None and not endgame_hold:
             candidates = [
                 item for item in obs["cubes"]
                 if distance(item["pos"], me["pos"]) < 30
@@ -393,7 +519,7 @@ class Bot:
                 goal = cube["pos"][:2]
                 mode = "cube"
 
-        if mode not in ("fight", "finish") and not many:
+        if mode not in ("fight", "finish", "drop") and not many and not endgame_hold:
             for pickup in obs["pickups"]:
                 kind = pickup["kind"]
                 d = distance(pickup["pos"], me["pos"])
@@ -430,6 +556,21 @@ class Bot:
 
         goal_distance = distance(goal, me["pos"])
         urgent = not me["in_zone"] or (mode in ("cover", "recover") and under_fire)
+
+        if not urgent and mode in ("zone", "cube", "loot", "drop") and not threats:
+            walk = me["stats"].get("walk_speed", 11.7)
+            quiet_scale = min(1.0, 4.2 / max(walk, 0.001))
+            move = [move[0] * quiet_scale, move[1] * quiet_scale]
+
+        if self.stuck > 0.7:
+            tangent = [-move[1] * self.strafe_sign, move[0] * self.strafe_sign]
+            if math.hypot(move[0], move[1]) > 0.1:
+                move = tangent
+            elif goal_distance > 2.5:
+                yaw = math.atan2(goal[1] - me["pos"][1], goal[0] - me["pos"][0])
+                move = [math.cos(yaw + self.strafe_sign * 1.35),
+                        math.sin(yaw + self.strafe_sign * 1.35)]
+
         boost = (
             math.hypot(move[0], move[1]) > 0.1
             and me["energy"] > (30 if urgent else 45)
@@ -440,9 +581,11 @@ class Bot:
         if self.last_position is not None:
             moved = distance(me["pos"], self.last_position)
             trying = math.hypot(*self.previous_move) > 0.5
-            self.stuck = self.stuck + 0.1 if trying and moved < 0.13 else max(0.0, self.stuck - 0.2)
+            elapsed = max(0.05, now - self.last_obs_time) if self.last_obs_time >= 0 else 0.1
+            self.stuck = self.stuck + elapsed if trying and moved < 0.13 else max(0.0, self.stuck - elapsed)
         self.last_position = me["pos"][:]
         self.previous_move = move[:]
+        self.last_obs_time = now
 
         aim = [me["aim"][0], me["aim"][1]]
         fire = [False, False]

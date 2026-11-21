@@ -1,7 +1,9 @@
 # Builder-Apex
 
 Placement-oriented bot for the Builders Mech Royale track. Keep `Dockerfile`,
-`example_bot.py`, `mechfight.py`, and `navigation.py` at the repository root.
+`example_bot.py`, and `mechfight.py` at the repository root. All custom bot
+logic is implemented inside `example_bot.py`; `mechfight.py` is only the
+official protocol transport wrapper.
 
 The policy emphasizes survival over chasing kills:
 
@@ -28,3 +30,7 @@ Build the Linux image from this folder:
 ```powershell
 docker build --platform linux/amd64 -t builders-apex-bot .
 ```
+
+The report [ADVANCED_RESEARCH_REPORT.md](ADVANCED_RESEARCH_REPORT.md) is the
+architecture reference for this implementation. The submitted bot does not
+depend on external custom Python modules or a downloaded model.

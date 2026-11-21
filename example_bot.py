@@ -1,7 +1,12 @@
 """Placement-oriented mechfight/1 bot with zone, cover, loot and combat policy."""
 import math
+import heapq
+import json
+import os
+import sys
+import time
+from array import array
 import mechfight as mf
-from navigation import ArenaNavigator
 
 
 TAU = 2.0 * math.pi
@@ -51,6 +56,211 @@ def lead_position(origin, target, projectile_speed):
     return [target["pos"][i] + velocity[i] * flight for i in range(3)]
 
 
+class EmbeddedArenaRouter:
+    """Standard-library A* route grid embedded into the submitted bot."""
+
+    resolution = 8.0
+
+    def __init__(self, map_dir: str, mech_config: dict) -> None:
+        world_path = os.path.join(map_dir, "v2", "world.json")
+        with open(world_path, "r", encoding="utf-8") as source:
+            world = json.load(source)
+        bounds = world["bounds"]
+        self.min_x = float(bounds["minX"])
+        self.min_y = float(bounds["minY"])
+        self.max_x = float(bounds["maxX"])
+        self.max_y = float(bounds["maxY"])
+        self.nx = max(1, int(math.ceil((self.max_x - self.min_x) / self.resolution)))
+        self.ny = max(1, int(math.ceil((self.max_y - self.min_y) / self.resolution)))
+        self.radius = float(mech_config.get("radius", 2.5))
+        self.height = float(mech_config.get("height", 9.0))
+        self.step_up = float(mech_config.get("step_up", 1.2))
+        self.cache_goal = None
+        self.cache_path = None
+
+        terrain = world["terrain"]
+        heights = array("h")
+        with open(os.path.join(map_dir, "v2", terrain["file"]), "rb") as source:
+            heights.frombytes(source.read())
+        if sys.byteorder != "little":
+            heights.byteswap()
+        self.terrain = heights
+        self.tnx = int(terrain["nx"])
+        self.tny = int(terrain["ny"])
+        self.tx = float(terrain["minX"])
+        self.ty = float(terrain["minY"])
+        self.tstep = float(terrain["step"])
+        self.tscale = float(terrain["scale"])
+        self.blocked = bytearray(self.nx * self.ny)
+        self._rasterize(world.get("prisms", []))
+
+    def _point(self, cell: int) -> tuple[float, float]:
+        x = cell % self.nx
+        y = cell // self.nx
+        return (
+            self.min_x + (x + 0.5) * self.resolution,
+            self.min_y + (y + 0.5) * self.resolution,
+        )
+
+    def _cell(self, x: float, y: float) -> int | None:
+        i = int((x - self.min_x) / self.resolution)
+        j = int((y - self.min_y) / self.resolution)
+        if not (0 <= i < self.nx and 0 <= j < self.ny):
+            return None
+        return j * self.nx + i
+
+    def _ground(self, x: float, y: float) -> float:
+        gx = (x - self.tx) / self.tstep
+        gy = (y - self.ty) / self.tstep
+        ix = max(0, min(self.tnx - 2, int(gx)))
+        iy = max(0, min(self.tny - 2, int(gy)))
+        ax = max(0.0, min(1.0, gx - ix))
+        ay = max(0.0, min(1.0, gy - iy))
+        n = iy * self.tnx + ix
+        h00 = self.terrain[n] * self.tscale
+        h10 = self.terrain[n + 1] * self.tscale
+        h01 = self.terrain[n + self.tnx] * self.tscale
+        h11 = self.terrain[n + self.tnx + 1] * self.tscale
+        low = h00 * (1 - ax) + h10 * ax
+        high = h01 * (1 - ax) + h11 * ax
+        return low * (1 - ay) + high * ay
+
+    @staticmethod
+    def _inside(x: float, y: float, ring: list[float]) -> bool:
+        if len(ring) < 6:
+            return False
+        inside = False
+        count = len(ring) // 2
+        j = count - 1
+        for i in range(count):
+            xi, yi = ring[i * 2], ring[i * 2 + 1]
+            xj, yj = ring[j * 2], ring[j * 2 + 1]
+            if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+                inside = not inside
+            j = i
+        return inside
+
+    def _rasterize(self, prisms: list[dict]) -> None:
+        margin = self.radius + 3.0
+        for prism in prisms:
+            if prism.get("kind") not in ("building", "stadium", "bridge"):
+                continue
+            ring = prism.get("ring", [])
+            if len(ring) < 6:
+                continue
+            xs, ys = ring[0::2], ring[1::2]
+            min_i = max(0, int((min(xs) - margin - self.min_x) / self.resolution))
+            max_i = min(self.nx - 1, int((max(xs) + margin - self.min_x) / self.resolution))
+            min_j = max(0, int((min(ys) - margin - self.min_y) / self.resolution))
+            max_j = min(self.ny - 1, int((max(ys) + margin - self.min_y) / self.resolution))
+            top = float(prism["top"])
+            base = float(prism["base"])
+            for j in range(min_j, max_j + 1):
+                for i in range(min_i, max_i + 1):
+                    x = self.min_x + (i + 0.5) * self.resolution
+                    y = self.min_y + (j + 0.5) * self.resolution
+                    if not self._inside(x, y, ring):
+                        continue
+                    if any(self._inside(x, y, hole) for hole in prism.get("holes", [])):
+                        continue
+                    ground = self._ground(x, y)
+                    if top <= ground + self.step_up or base >= ground + self.height:
+                        continue
+                    self.blocked[j * self.nx + i] = 1
+
+    def _nearest_open(self, cell: int | None) -> int | None:
+        if cell is not None and not self.blocked[cell]:
+            return cell
+        if cell is None:
+            return None
+        x, y = cell % self.nx, cell // self.nx
+        for radius in range(1, 12):
+            candidates = []
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dy)) != radius:
+                        continue
+                    xx, yy = x + dx, y + dy
+                    if 0 <= xx < self.nx and 0 <= yy < self.ny:
+                        candidate = yy * self.nx + xx
+                        if not self.blocked[candidate]:
+                            candidates.append(candidate)
+            if candidates:
+                return min(
+                    candidates,
+                    key=lambda item: (item % self.nx - x) ** 2 + (item // self.nx - y) ** 2,
+                )
+        return None
+
+    def _neighbors(self, cell: int):
+        x, y = cell % self.nx, cell // self.nx
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            xx, yy = x + dx, y + dy
+            if not (0 <= xx < self.nx and 0 <= yy < self.ny):
+                continue
+            neighbor = yy * self.nx + xx
+            if self.blocked[neighbor]:
+                continue
+            if dx and dy and (
+                self.blocked[y * self.nx + xx] or self.blocked[yy * self.nx + x]
+            ):
+                continue
+            yield neighbor, math.sqrt(2.0) if dx and dy else 1.0
+
+    def direction(self, start: list[float] | tuple[float, ...],
+                  goal: list[float] | tuple[float, ...]) -> list[float] | None:
+        start_cell = self._nearest_open(self._cell(start[0], start[1]))
+        goal_cell = self._nearest_open(self._cell(goal[0], goal[1]))
+        if start_cell is None or goal_cell is None:
+            return unit(goal[0] - start[0], goal[1] - start[1])
+        if goal_cell != self.cache_goal or self.cache_path is None:
+            start_time = time.perf_counter()
+            frontier = [(0.0, start_cell)]
+            came_from = {start_cell: None}
+            cost = {start_cell: 0.0}
+            goal_x, goal_y = goal_cell % self.nx, goal_cell // self.nx
+            found = False
+            expansions = 0
+            while frontier and expansions < 2200:
+                if expansions > 0 and time.perf_counter() - start_time > 0.012:
+                    break
+                _, current = heapq.heappop(frontier)
+                if current == goal_cell:
+                    found = True
+                    break
+                expansions += 1
+                for neighbor, length in self._neighbors(current):
+                    new_cost = cost[current] + length
+                    if new_cost >= cost.get(neighbor, float("inf")):
+                        continue
+                    cost[neighbor] = new_cost
+                    came_from[neighbor] = current
+                    x, y = neighbor % self.nx, neighbor // self.nx
+                    heuristic = math.hypot(goal_x - x, goal_y - y)
+                    heapq.heappush(frontier, (new_cost + heuristic, neighbor))
+            path = []
+            if found:
+                current = goal_cell
+                while current is not None:
+                    path.append(current)
+                    current = came_from.get(current)
+                path.reverse()
+            self.cache_goal = goal_cell
+            self.cache_path = path or None
+        if not self.cache_path:
+            return unit(goal[0] - start[0], goal[1] - start[1])
+        nearest = min(
+            range(len(self.cache_path)),
+            key=lambda index: math.dist(self._point(self.cache_path[index]), start),
+        )
+        waypoint = self._point(self.cache_path[nearest])
+        dx, dy = waypoint[0] - start[0], waypoint[1] - start[1]
+        if math.hypot(dx, dy) < 1.0:
+            dx, dy = goal[0] - start[0], goal[1] - start[1]
+        return [dx, dy]
+
+
 class Bot:
     name = "Builder-Apex"
 
@@ -84,7 +294,7 @@ class Bot:
         self.last_action = {"tick": 0, "move": [0.0, 0.0], "aim": [0.0, 0.0],
                             "boost": False, "jump": False, "fire": [False, False]}
         try:
-            self.navigator = ArenaNavigator(hello["map"]["dir"], self.config["mech"])
+            self.navigator = EmbeddedArenaRouter(hello["map"]["dir"], self.config["mech"])
         except (OSError, KeyError, ValueError):
             pass
 
@@ -224,8 +434,7 @@ class Bot:
         routed = self.navigator.direction(me["pos"][:2], goal)
         if routed is None:
             return unit(goal[0] - me["pos"][0], goal[1] - me["pos"][1])
-        move = unit(routed[0], routed[1])
-        return self.navigator.constrain(me["pos"][:2], move)
+        return unit(routed[0], routed[1])
 
     def upgrade_choice(self, obs, me):
         offer = obs["offer"]
